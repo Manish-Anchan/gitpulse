@@ -55,10 +55,10 @@ def health_check():
 @app.get("/api/tools")
 async def list_available_tools(agent: GitPulseAgent = Depends(get_agent)):
     """Inspect all active MCP tools exposed to the agent."""
-    tools = await agent.get_openai_tool_definitions()
+    tools = await agent.get_anthropic_tool_definitions()
     return {
         "total_tools": len(tools),
-        "tools": [t["function"] for t in tools]
+        "tools": tools
     }
 
 
