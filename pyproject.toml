@@ -1,7 +1,7 @@
 [project]
 name = "gitpulse"
 version = "0.1.0"
-description = "Add your description here"
+description = "MCP-powered codebase intelligence agent"
 readme = "README.md"
 authors = [
     { name = "Manish Anchan", email = "manishanchan789@gmail.com" }
@@ -15,9 +15,5 @@ dependencies = [
     "uvicorn>=0.52.4",
 ]
 
-[project.scripts]
-gitpulse = "gitpulse:main"
-
-[build-system]
-requires = ["uv_build>=0.12.5,<0.13.0"]
-build-backend = "uv_build"
+[tool.uv]
+package = false
