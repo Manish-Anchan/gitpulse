@@ -12,6 +12,8 @@ dependencies = [
     "fastmcp>=4.0.2",
     "openai>=3.7.0",
     "python-dotenv>=1.2.3",
+    "requests>=2.34.2",
+    "streamlit>=1.63.0",
     "uvicorn>=0.52.4",
 ]
 
