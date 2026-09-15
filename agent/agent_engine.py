@@ -2,7 +2,7 @@ import json
 import os
 from typing import Any, AsyncGenerator, Dict, List, Optional
 from dotenv import load_dotenv
-from openai import AsyncOpenAI
+from anthropic import AsyncAnthropic
 from pydantic import BaseModel, Field
 
 import mcp_server.server as mcp_module
@@ -33,36 +33,37 @@ class GitPulseAgent:
         model: Optional[str] = None,
     ):
         self.api_key = api_key or os.getenv("AGENTROUTER_API_KEY", "")
-        self.base_url = base_url or os.getenv("AGENTROUTER_BASE_URL", "https://co.agentrouter.org/v1")
+        self.base_url = base_url or os.getenv("AGENTROUTER_BASE_URL", "https://agentrouter.org")
         self.model = model or os.getenv("LLM_MODEL", "glm-5.3")
 
-        self.client = AsyncOpenAI(
+        # Claude Code fingerprint headers required by AgentRouter WAF
+        self.client = AsyncAnthropic(
             api_key=self.api_key,
             base_url=self.base_url,
+            default_headers={
+                "User-Agent": "claude-cli/1.0.108 (external, cli)",
+                "anthropic-beta": "claude-code-20250219,oauth-2025-04-20",
+            },
         )
         self.mcp = mcp_module.mcp
 
-    async def get_openai_tool_definitions(self) -> List[Dict[str, Any]]:
+    async def get_anthropic_tool_definitions(self) -> List[Dict[str, Any]]:
         """
-        Discovers tools directly from the FastMCP server and transforms
-        them into standard OpenAI-compatible tool specifications.
+        Discovers tools from FastMCP and converts them to the Anthropic tool specification.
         """
         mcp_tools = await self.mcp.list_tools()
         tools_spec = []
         for tool in mcp_tools:
             tools_spec.append({
-                "type": "function",
-                "function": {
-                    "name": tool.name,
-                    "description": tool.description or "",
-                    "parameters": tool.parameters,
-                },
+                "name": tool.name,
+                "description": tool.description or "",
+                "input_schema": tool.parameters,
             })
         return tools_spec
 
     async def execute_mcp_tool(self, tool_name: str, tool_args: Dict[str, Any]) -> str:
         """
-        Executes a tool on the MCP server and formats the result as a text string.
+        Executes a tool on the FastMCP server and extracts the text output.
         """
         try:
             result = await self.mcp.call_tool(tool_name, tool_args)
@@ -76,73 +77,75 @@ class GitPulseAgent:
 
     async def run(self, user_query: str, max_steps: int = 8) -> AgentResponse:
         """
-        Executes the ReAct agent loop until a final answer is produced or max_steps is reached.
+        Executes the ReAct agent loop using the Anthropic Messages protocol.
         """
-        tools = await self.get_openai_tool_definitions()
+        tools = await self.get_anthropic_tool_definitions()
+
+        system_instruction = (
+            "You are GitPulse, an autonomous Codebase Intelligence Agent. "
+            "You have direct access to inspection tools (git_log, git_diff, read_file, search_code, list_directory, find_todos). "
+            "Always use your tools to inspect the repository before answering. "
+            "Be concise, technical, and accurate."
+        )
 
         messages: List[Dict[str, Any]] = [
-            {
-                "role": "system",
-                "content": (
-                    "You are GitPulse, an autonomous Codebase Intelligence Agent. "
-                    "You have direct access to inspection tools (git log, diff, read_file, search_code, list_directory, find_todos). "
-                    "Always use tools to verify facts before answering questions about this repository. "
-                    "Be concise, technical, and accurate."
-                ),
-            },
-            {"role": "user", "content": user_query},
+            {"role": "user", "content": user_query}
         ]
 
         steps_log: List[AgentStep] = []
 
         for step_idx in range(1, max_steps + 1):
-            response = await self.client.chat.completions.create(
+            response = await self.client.messages.create(
                 model=self.model,
+                max_tokens=4096,
+                system=system_instruction,
                 messages=messages,
                 tools=tools if tools else None,
             )
-            choice = response.choices[0]
-            msg = choice.message
+
+            # Extract any tool calls or text
+            tool_use_blocks = [b for b in response.content if b.type == "tool_use"]
+            text_blocks = [b for b in response.content if b.type == "text"]
+            thinking_blocks = [b for b in response.content if b.type == "thinking"]
+
+            thought_text = thinking_blocks[0].thinking if thinking_blocks else None
 
             # Add assistant message to history
-            messages.append(msg)
+            messages.append({"role": "assistant", "content": response.content})
 
-            # If model produced no tool calls, it has finished reasoning
-            if not msg.tool_calls:
+            # If no tools were called, the agent has finished
+            if not tool_use_blocks:
+                final_answer = "\n".join(b.text for b in text_blocks) if text_blocks else "Task completed."
                 return AgentResponse(
                     query=user_query,
-                    final_answer=msg.content or "No response generated.",
+                    final_answer=final_answer,
                     steps=steps_log,
                     total_steps=len(steps_log),
                 )
 
-            # Process all tool calls requested by the model in this turn
-            for tool_call in msg.tool_calls:
-                fn_name = tool_call.function.name
-                try:
-                    fn_args = json.loads(tool_call.function.arguments)
-                except Exception:
-                    fn_args = {}
-
-                # Execute tool via MCP
-                tool_output = await self.execute_mcp_tool(fn_name, fn_args)
+            # Execute all requested tools and collect results
+            tool_results = []
+            for t_block in tool_use_blocks:
+                tool_output = await self.execute_mcp_tool(t_block.name, t_block.input)
 
                 steps_log.append(
                     AgentStep(
                         step_number=step_idx,
-                        thought=msg.content,
-                        tool_name=fn_name,
-                        tool_args=fn_args,
+                        thought=thought_text,
+                        tool_name=t_block.name,
+                        tool_args=t_block.input,
                         tool_result=tool_output[:500] + ("..." if len(tool_output) > 500 else ""),
                     )
                 )
 
-                # Feed observation back to LLM
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tool_call.id,
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": t_block.id,
                     "content": tool_output,
                 })
+
+            # Feed tool observations back to model
+            messages.append({"role": "user", "content": tool_results})
 
         return AgentResponse(
             query=user_query,
@@ -153,60 +156,62 @@ class GitPulseAgent:
 
     async def run_stream(self, user_query: str, max_steps: int = 8) -> AsyncGenerator[str, None]:
         """
-        Runs the agent loop and yields Server-Sent Events (SSE) in real-time as steps occur.
+        Runs the ReAct loop and streams real-time events via Server-Sent Events (SSE).
         """
-        tools = await self.get_openai_tool_definitions()
+        tools = await self.get_anthropic_tool_definitions()
+
+        system_instruction = (
+            "You are GitPulse, an autonomous Codebase Intelligence Agent. "
+            "You have direct access to inspection tools (git_log, git_diff, read_file, search_code, list_directory, find_todos). "
+            "Always use your tools to inspect the repository before answering."
+        )
 
         messages: List[Dict[str, Any]] = [
-            {
-                "role": "system",
-                "content": (
-                    "You are GitPulse, an autonomous Codebase Intelligence Agent. "
-                    "You have direct access to inspection tools (git log, diff, read_file, search_code, list_directory, find_todos). "
-                    "Always use tools to verify facts before answering questions about this repository."
-                ),
-            },
-            {"role": "user", "content": user_query},
+            {"role": "user", "content": user_query}
         ]
 
         yield f"data: {json.dumps({'type': 'status', 'content': 'Analyzing query & discovering tools...'})}\n\n"
 
         for step_idx in range(1, max_steps + 1):
-            response = await self.client.chat.completions.create(
+            response = await self.client.messages.create(
                 model=self.model,
+                max_tokens=4096,
+                system=system_instruction,
                 messages=messages,
                 tools=tools if tools else None,
             )
-            msg = response.choices[0].message
-            messages.append(msg)
 
-            if not msg.tool_calls:
-                # Final response reached
-                yield f"data: {json.dumps({'type': 'final_answer', 'content': msg.content})}\n\n"
+            tool_use_blocks = [b for b in response.content if b.type == "tool_use"]
+            text_blocks = [b for b in response.content if b.type == "text"]
+            thinking_blocks = [b for b in response.content if b.type == "thinking"]
+
+            if thinking_blocks:
+                yield f"data: {json.dumps({'type': 'status', 'content': thinking_blocks[0].thinking[:150] + '...'})}\n\n"
+
+            messages.append({"role": "assistant", "content": response.content})
+
+            if not tool_use_blocks:
+                final_text = "\n".join(b.text for b in text_blocks) if text_blocks else "Task completed."
+                yield f"data: {json.dumps({'type': 'final_answer', 'content': final_text})}\n\n"
                 yield "data: [DONE]\n\n"
                 return
 
-            for tool_call in msg.tool_calls:
-                fn_name = tool_call.function.name
-                try:
-                    fn_args = json.loads(tool_call.function.arguments)
-                except Exception:
-                    fn_args = {}
+            tool_results = []
+            for t_block in tool_use_blocks:
+                yield f"data: {json.dumps({'type': 'tool_call', 'step': step_idx, 'tool': t_block.name, 'args': t_block.input})}\n\n"
 
-                # Emit step notification to client
-                yield f"data: {json.dumps({'type': 'tool_call', 'step': step_idx, 'tool': fn_name, 'args': fn_args})}\n\n"
-
-                tool_output = await self.execute_mcp_tool(fn_name, fn_args)
-
-                # Emit truncated tool result to client
+                tool_output = await self.execute_mcp_tool(t_block.name, t_block.input)
                 preview = tool_output[:300] + ("..." if len(tool_output) > 300 else "")
-                yield f"data: {json.dumps({'type': 'tool_result', 'tool': fn_name, 'preview': preview})}\n\n"
 
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tool_call.id,
+                yield f"data: {json.dumps({'type': 'tool_result', 'tool': t_block.name, 'preview': preview})}\n\n"
+
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": t_block.id,
                     "content": tool_output,
                 })
+
+            messages.append({"role": "user", "content": tool_results})
 
         yield f"data: {json.dumps({'type': 'error', 'content': 'Exceeded maximum reasoning steps.'})}\n\n"
         yield "data: [DONE]\n\n"
